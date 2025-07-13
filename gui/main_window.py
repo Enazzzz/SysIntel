@@ -44,6 +44,8 @@ class SysIntelGUI:
         self.update_interval = 500  # Default 0.5 seconds
         self.temp_unit = 'C'  # Default temperature unit
         self.update_stats_after_id = None
+        self.prev_disk_io = None  # Track previous disk I/O for speed calculation
+        self.prev_disk_busy_time = None  # Track previous disk busy time for utilization calculation
         self.load_config()
         self._set_data_history_length()
         self.build_ui()
@@ -83,7 +85,10 @@ class SysIntelGUI:
             'gpu_usage': deque(maxlen=points),
             'gpu_temp': deque(maxlen=points),
             'cpu_temp': deque(maxlen=points),
-            'fan_speeds': deque(maxlen=points)
+            'fan_speeds': deque(maxlen=points),
+            'disk_read_speed': deque(maxlen=points),
+            'disk_write_speed': deque(maxlen=points),
+            'disk_io_utilization': deque(maxlen=points)
         }
 
     def build_ui(self):
@@ -114,6 +119,7 @@ class SysIntelGUI:
         self.create_gpu_tab()
         self.create_fan_tab()
         self.create_network_tab()
+        self.create_disk_tab()  # Add disk tab
         self.create_system_tab()
         self.create_temp_tab()  # Add temperature tab
         self.create_settings_tab()
@@ -232,6 +238,49 @@ class SysIntelGUI:
             ("Total Received", "net_recv"),
             ("Ethernet Adapters", "eth_adapters"),
             ("Wi-Fi Adapters", "wifi_adapters")
+        ])
+
+    def create_disk_tab(self):
+        """Create Disk monitoring tab with I/O graphs"""
+        disk_frame = tk.Frame(self.notebook, bg=self.colors['bg'])
+        self.notebook.add(disk_frame, text="Disk")
+        
+        # Create dual-line graph for read/write speeds
+        graph = DualLineGraph(disk_frame, 
+            [self.data_history['disk_read_speed'], self.data_history['disk_write_speed']],
+            [self.colors['success'], self.colors['warning']],
+            y_min=0, y_max=1000, seconds=self.history_seconds,
+            bg=self.colors['chart_bg'], grid=self.colors['chart_grid'],
+            label='Disk I/O Speed (MB/s)', label_color=self.colors['fg'],
+            smoothing=self.smoothing_style,
+            legends=[('Read Speed', self.colors['success']), ('Write Speed', self.colors['warning'])]
+        )
+        graph.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 0))
+        self.graphs['disk_io'] = graph
+        
+        # Create I/O utilization graph
+        util_graph = ScrollingGraph(disk_frame, 
+            self.data_history['disk_io_utilization'], 
+            self.colors['info'], 0, 100, seconds=self.history_seconds,
+            bg=self.colors['chart_bg'], grid=self.colors['chart_grid'],
+            label='Disk I/O Utilization (%)', label_color=self.colors['fg'],
+            smoothing=self.smoothing_style
+        )
+        util_graph.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.graphs['disk_util'] = util_graph
+        
+        # Disk details panel
+        details_frame = tk.Frame(disk_frame, bg=self.colors['secondary'], relief=tk.RAISED, bd=1)
+        details_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        
+        # Create disk details
+        self.create_detail_grid(details_frame, [
+            ("Total Read", "disk_total_read"),
+            ("Total Written", "disk_total_written"),
+            ("Read Operations", "disk_read_ops"),
+            ("Write Operations", "disk_write_ops"),
+            ("I/O Utilization", "disk_io_util"),
+            ("Active Disks", "disk_active_count")
         ])
 
     def create_system_tab(self):
@@ -430,7 +479,7 @@ class SysIntelGUI:
             ("CPU Usage", "cpu_usage"),
             ("Memory Usage", "mem_usage"),
             ("GPU Usage", "gpu_usage"),
-            ("GPU Temp", "gpu_temp"),
+            ("Disk I/O", "disk_io_util"),
             ("CPU Temp", "cpu_temp")
         ]
         for i, (label_text, key) in enumerate(fields):
@@ -475,10 +524,13 @@ class SysIntelGUI:
             stats = get_system_snapshot()
             # Efficiently log the new data point as compact CSV
             log_path = os.path.join(os.path.dirname(__file__), 'sysintel_log.csv')
-            log_fields = ['ts', 'cpu', 'mem', 'gpu', 'ct', 'gt', 'fan']
+            log_fields = ['ts', 'cpu', 'mem', 'gpu', 'ct', 'gt', 'fan', 'disk_io']
             # Use base36 for timestamp for compactness
             ts = int(time.time())
             ts_b36 = base36encode(ts)
+            # Get current disk utilization from graph data
+            current_disk_util = self.data_history['disk_io_utilization'][-1] if self.data_history['disk_io_utilization'] else 0
+            
             row = {
                 'ts': ts_b36,
                 'cpu': int(round(stats['cpu']['usage'])),
@@ -486,7 +538,8 @@ class SysIntelGUI:
                 'gpu': int(round(stats['gpu']['usage'])),
                 'ct': int(round(stats['cpu']['temperature'])),
                 'gt': int(round(stats['gpu']['temperature'])),
-                'fan': int(round(stats['fans']['cpu']))
+                'fan': int(round(stats['fans']['cpu'])),
+                'disk_io': int(round(current_disk_util))
             }
             write_header = not os.path.exists(log_path)
             with open(log_path, 'a', newline='', encoding='utf-8') as logf:
@@ -514,6 +567,41 @@ class SysIntelGUI:
             fan_speeds = [stats['fans']['cpu'], stats['fans']['gpu']] + stats['fans']['system']
             avg_fan_speed = sum(fan_speeds) / len(fan_speeds) if fan_speeds else 0
             self.data_history['fan_speeds'].append(avg_fan_speed)
+            
+            # Update disk I/O data
+            disk_io = stats['disk_io']
+            
+            # Calculate speeds in MB/s based on difference from previous measurement
+            if self.prev_disk_io is not None:
+                time_diff = self.update_interval / 1000.0  # Convert to seconds
+                read_diff = disk_io['total_read_bytes'] - self.prev_disk_io['total_read_bytes']
+                write_diff = disk_io['total_write_bytes'] - self.prev_disk_io['total_write_bytes']
+                
+                read_speed = (read_diff / (1024 * 1024)) / time_diff if time_diff > 0 else 0
+                write_speed = (write_diff / (1024 * 1024)) / time_diff if time_diff > 0 else 0
+                
+                # Calculate disk utilization as percentage of time disk was busy
+                total_busy_time = sum(disk['read_time'] + disk['write_time'] for disk in disk_io['disks'])
+                if self.prev_disk_busy_time is not None:
+                    busy_time_diff = total_busy_time - self.prev_disk_busy_time
+                    # busy_time_diff is in milliseconds, time_diff is in seconds
+                    # Convert time_diff to milliseconds and calculate percentage
+                    time_diff_ms = time_diff * 1000
+                    utilization = min(100, (busy_time_diff / time_diff_ms) * 100) if time_diff_ms > 0 else 0
+                else:
+                    utilization = 0
+            else:
+                read_speed = 0
+                write_speed = 0
+                utilization = 0
+            
+            self.data_history['disk_read_speed'].append(read_speed)
+            self.data_history['disk_write_speed'].append(write_speed)
+            self.data_history['disk_io_utilization'].append(utilization)
+            
+            # Store current values for next calculation
+            self.prev_disk_io = disk_io.copy()
+            self.prev_disk_busy_time = sum(disk['read_time'] + disk['write_time'] for disk in disk_io['disks'])
             
             # Update graphs
             self.update_graphs()
@@ -595,6 +683,10 @@ class SysIntelGUI:
             self.graphs['gpu'].redraw()
         if 'fans' in self.graphs:
             self.graphs['fans'].redraw()
+        if 'disk_io' in self.graphs:
+            self.graphs['disk_io'].redraw()
+        if 'disk_util' in self.graphs:
+            self.graphs['disk_util'].redraw()
         if 'temp' in self.graphs:
             self.graphs['temp'].redraw()
         if 'temp_tab' in self.graphs:
@@ -648,6 +740,18 @@ class SysIntelGUI:
         self.update_label("disk_partitions", partitions_text)
         types_text = ", ".join(set(stats['disk']['types'])) if stats['disk']['types'] else "None"
         self.update_label("disk_types", types_text)
+        
+        # Disk I/O Info
+        disk_io = stats['disk_io']
+        self.update_label("disk_total_read", format_bytes(disk_io['total_read_bytes']))
+        self.update_label("disk_total_written", format_bytes(disk_io['total_write_bytes']))
+        self.update_label("disk_read_ops", f"{disk_io['total_read_count']:,}")
+        self.update_label("disk_write_ops", f"{disk_io['total_write_count']:,}")
+        
+        # Use the calculated utilization from the graph data
+        current_utilization = self.data_history['disk_io_utilization'][-1] if self.data_history['disk_io_utilization'] else 0
+        self.update_label("disk_io_util", f"{current_utilization:.1f}%")
+        self.update_label("disk_active_count", f"{len(disk_io['disks'])} disks")
 
     def update_label(self, key, value):
         """Update a specific label with color coding"""
@@ -717,7 +821,7 @@ class SysIntelGUI:
         try:
             if os.path.exists(log_path):
                 with open(log_path, 'w', encoding='utf-8') as f:
-                    f.write('ts,cpu,mem,gpu,ct,gt,fan\n')
+                    f.write('ts,cpu,mem,gpu,ct,gt,fan,disk_io\n')
             self.status_label.config(text="Log reset!", fg=self.colors['success'])
         except Exception as e:
             self.status_label.config(text=f"Error resetting log: {e}", fg=self.colors['danger'])

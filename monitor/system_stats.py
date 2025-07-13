@@ -205,6 +205,49 @@ def get_disk_detailed_info():
     
     return disk_info
 
+def get_disk_io_stats():
+    """Get disk I/O statistics for all disks"""
+    disk_io = {
+        "total_read_bytes": 0,
+        "total_write_bytes": 0,
+        "total_read_count": 0,
+        "total_write_count": 0,
+        "read_speed_mbps": 0,
+        "write_speed_mbps": 0,
+        "io_utilization": 0,
+        "disks": []
+    }
+    
+    try:
+        # Get per-disk I/O counters
+        disk_io_counters = psutil.disk_io_counters(perdisk=True)
+        
+        for disk_name, counters in disk_io_counters.items():
+            disk_info = {
+                "name": disk_name,
+                "read_bytes": counters.read_bytes,
+                "write_bytes": counters.write_bytes,
+                "read_count": counters.read_count,
+                "write_count": counters.write_count,
+                "read_time": counters.read_time,
+                "write_time": counters.write_time
+            }
+            disk_io["disks"].append(disk_info)
+            
+            # Sum up totals
+            disk_io["total_read_bytes"] += counters.read_bytes
+            disk_io["total_write_bytes"] += counters.write_bytes
+            disk_io["total_read_count"] += counters.read_count
+            disk_io["total_write_count"] += counters.write_count
+        
+        # Utilization will be calculated in the main window based on time differences
+        disk_io["io_utilization"] = 0
+            
+    except Exception as e:
+        print(f"Error getting disk I/O stats: {e}")
+    
+    return disk_io
+
 def get_system_detailed_info():
     """Get comprehensive system information"""
     return {
@@ -225,5 +268,6 @@ def get_system_snapshot():
         "fans": get_fan_speeds(),
         "network": get_network_detailed_info(),
         "disk": get_disk_detailed_info(),
+        "disk_io": get_disk_io_stats(),
         "system": get_system_detailed_info()
     }
